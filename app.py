@@ -4,6 +4,7 @@ import io, os, gc
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+from openpyxl.cell import WriteOnlyCell
 from datetime import datetime
 
 app = Flask(__name__)
@@ -13,102 +14,105 @@ app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
 BLK='000000'; WHT='FFFFFF'; ORG='E97132'; GRY='F2F2F2'; GRN='C6EFCE'; RED='FFC7CE'
 FMT_EUR='_-* #,##0.00\\ "€"_-;\\-* #,##0.00\\ "€"_-;_-* "-"??\\ "€"_-;_-@_-'
 FMT_INT='#,##0'; FMT_PCT='0.0%'
-fill  = lambda c: PatternFill('solid', fgColor=c)
-font  = lambda c=BLK, b=False, sz=11: Font(name='Calibri', size=sz, bold=b, color=c)
-align = lambda h='center': Alignment(horizontal=h, vertical='center')
-r2    = lambda n: round(float(n), 2) if n is not None else None
 
-# ── Carga optimizada del maestro ──────────────────────────────────────────────
+def mk_fill(c):  return PatternFill('solid', fgColor=c)
+def mk_font(c=BLK, b=False, sz=11): return Font(name='Calibri', size=sz, bold=b, color=c)
+def mk_align(h='center'): return Alignment(horizontal=h, vertical='center')
+
+# Pre-construir estilos reutilizables (no crear uno nuevo por celda)
+ST = {
+    'hdr_blk': (mk_font(WHT,True), mk_fill(BLK), mk_align()),
+    'hdr_org': (mk_font(WHT,True), mk_fill(ORG), mk_align()),
+    'dat_txt': (mk_font(),         None,          mk_align()),
+    'dat_eur': (mk_font(),         None,          mk_align()),
+    'dat_int': (mk_font(),         None,          mk_align()),
+    'alt_txt': (mk_font(),         mk_fill(GRY),  mk_align()),
+    'alt_eur': (mk_font(),         mk_fill(GRY),  mk_align()),
+    'alt_int': (mk_font(),         mk_fill(GRY),  mk_align()),
+    'dif_grn': (mk_font(),         mk_fill(GRN),  mk_align()),
+    'dif_red': (mk_font(),         mk_fill(RED),  mk_align()),
+    'res_ttl': (mk_font(BLK,True,13), None,       None),
+    'res_hdr': (mk_font(WHT,True), mk_fill(BLK),  mk_align()),
+    'res_tot': (mk_font(WHT,True), mk_fill(ORG),  mk_align()),
+}
+
+r2 = lambda n: round(float(n), 2) if n is not None else None
+
+# ── Carga optimizada ──────────────────────────────────────────────────────────
 COLS_NEEDED = ['tienda','COMPARABLE','temporada','Vender_en','seccion','gama',
                'articulo','codart','color','neto','qty','fecha']
 
 def load_maestro(file_obj):
-    # Leer cabecera para detectar nombres exactos (case-insensitive)
     header_df = pd.read_excel(file_obj, nrows=0)
     file_obj.seek(0)
     col_map = {}
     for col in header_df.columns:
-        cl = col.strip().lower()
         for needed in COLS_NEEDED:
-            if cl == needed.lower():
+            if col.strip().lower() == needed.lower():
                 col_map[col] = needed
-
     missing = [c for c in COLS_NEEDED if c not in col_map.values()]
     if missing:
-        raise ValueError(f'Columnas no encontradas: {missing}. Cabecera: {list(header_df.columns)}')
-
-    # Cargar SOLO las columnas necesarias — ahorra ~90% de memoria
+        raise ValueError(f'Columnas no encontradas: {missing}')
     df = pd.read_excel(file_obj, usecols=list(col_map.keys()),
-                       dtype={'codart': str, 'color': str, 'tienda': str,
-                              'articulo': str, 'gama': str, 'seccion': str,
-                              'temporada': str, 'Vender_en': str})
+                       dtype={k: str for k in col_map if col_map[k] in
+                              ['tienda','COMPARABLE','temporada','Vender_en',
+                               'seccion','gama','articulo','codart','color']})
     df.rename(columns=col_map, inplace=True)
-
-    # Tipos optimizados
     df['neto']  = pd.to_numeric(df['neto'],  errors='coerce').fillna(0).astype('float32')
     df['qty']   = pd.to_numeric(df['qty'],   errors='coerce').fillna(0).astype('float32')
     df['fecha'] = pd.to_numeric(df['fecha'], errors='coerce').fillna(0).astype('int16')
-
-    # Strings a categoría (enorme ahorro en columnas repetitivas)
     for col in ['tienda','COMPARABLE','temporada','Vender_en','seccion','gama','articulo','color']:
-        df[col] = df[col].fillna('').astype(str).str.strip().astype('category')
+        df[col] = df[col].fillna('').astype(str).str.strip()
+    df['COMPARABLE'] = df['COMPARABLE'].replace({'0':'','nan':'','None':''})
+    for col in ['tienda','COMPARABLE','temporada','Vender_en','seccion','gama','articulo','color']:
+        df[col] = df[col].astype('category')
+    return df[df['fecha'].isin([2025, 2026])].copy()
 
-    # Normalizar COMPARABLE: 0 → ''
-    # FIX: replace instead of rename_categories to avoid duplicate error
-    df['COMPARABLE'] = df['COMPARABLE'].astype(str).replace({'0':'','nan':'','None':''}).astype('category')
-
-    # Filtrar solo años válidos
-    df = df[df['fecha'].isin([2025, 2026])].copy()
-    return df
-
-# ── Helpers de cálculo ────────────────────────────────────────────────────────
+# ── Cálculos ──────────────────────────────────────────────────────────────────
 def map_vend(v):
-    if v == 'SS26': return 'SS26'
-    if v == 'NOS CONTINUATIVO': return 'NOS'
-    if v == 'FIN EXISTENCIAS':  return 'FE'
-    if v == 'CEREMONIA':        return 'CEREMONIA'
+    if v=='SS26': return 'SS26'
+    if v=='NOS CONTINUATIVO': return 'NOS'
+    if v=='FIN EXISTENCIAS':  return 'FE'
+    if v=='CEREMONIA':        return 'CEREMONIA'
     return None
 
 def pneto(df, idx):
-    g26 = df[df['fecha']==2026].groupby(idx)['neto'].sum().rename(2026)
-    g25 = df[df['fecha']==2025].groupby(idx)['neto'].sum().rename(2025)
-    out = pd.concat([g26, g25], axis=1).fillna(0).reset_index()
-    out['DIF'] = out[2026] - out[2025]
-    return out.sort_values(2026, ascending=False).reset_index(drop=True)
+    g26=df[df['fecha']==2026].groupby(idx)['neto'].sum().rename(2026)
+    g25=df[df['fecha']==2025].groupby(idx)['neto'].sum().rename(2025)
+    out=pd.concat([g26,g25],axis=1).fillna(0).reset_index()
+    out['DIF']=out[2026]-out[2025]
+    return out.sort_values(2026,ascending=False).reset_index(drop=True)
 
-# ── Cálculos de cada pestaña ──────────────────────────────────────────────────
 def calc_resumen(df):
     def build_block(data):
-        d26 = data[data['fecha']==2026]; d25 = data[data['fecha']==2025]
-        by26 = d26.groupby('seccion')['neto'].sum()
-        by25 = d25.groupby('seccion')['neto'].sum()
-        tot26 = float(by26.sum())
-        d26v = d26.copy(); d26v['tg'] = d26v['Vender_en'].astype(str).map(map_vend)
-        tn = d26v[d26v['tg'].notna()].groupby(['seccion','tg'])['neto'].sum().unstack(fill_value=0)
+        d26=data[data['fecha']==2026]; d25=data[data['fecha']==2025]
+        by26=d26.groupby('seccion')['neto'].sum()
+        by25=d25.groupby('seccion')['neto'].sum()
+        tot26=float(by26.sum())
+        d26v=d26.copy(); d26v['tg']=d26v['Vender_en'].astype(str).map(map_vend)
+        tn=d26v[d26v['tg'].notna()].groupby(['seccion','tg'])['neto'].sum().unstack(fill_value=0)
         for c in ['SS26','NOS','FE','CEREMONIA']:
-            if c not in tn.columns: tn[c] = 0.0
-        rows = []
+            if c not in tn.columns: tn[c]=0.0
+        rows=[]
         for sec in by26.sort_values(ascending=False).index:
             n26=r2(by26.get(sec,0)); n25=r2(by25.get(sec,0))
-            pct = round(n26/tot26,4) if tot26 else 0
-            ts = [r2(tn.loc[sec,c]) if sec in tn.index else 0 for c in ['SS26','NOS','FE','CEREMONIA']]
-            tp = [round(t/n26,4) if n26 else 0 for t in ts]
+            pct=round(n26/tot26,4) if tot26 else 0
+            ts=[r2(tn.loc[sec,c]) if sec in tn.index else 0 for c in ['SS26','NOS','FE','CEREMONIA']]
+            tp=[round(t/n26,4) if n26 else 0 for t in ts]
             rows.append([sec,n26,n25,r2(n26-n25),pct,None,sec]+ts+[r2(sum(ts)),None,sec]+tp)
         tn26=r2(by26.sum()); tn25=r2(by25.sum())
         tt=[r2(tn[c].sum()) if c in tn.columns else 0 for c in ['SS26','NOS','FE','CEREMONIA']]
         ttp=[round(t/tn26,4) if tn26 else 0 for t in tt]
         rows.append(['Total general',tn26,tn25,r2(tn26-tn25),1.0,None,'Total general']+tt+[r2(sum(tt)),None,'Total general']+ttp)
         return rows
-    hdr=['SECCIÓN',2026,2025,'DIF NETO','%',None,'SECCIÓN','SS26','NOS','FE','CEREMONIA','Total general',None,'SECCIÓN','SS26%','NOS%','FE%','CER%']
-    comp = df[df['COMPARABLE'].isin(['SI','SI - Reformada'])]
+    hdr=['SECCIÓN',2026,2025,'DIF NETO','%',None,'SECCIÓN','SS26','NOS','FE','CEREMONIA','Total',None,'SECCIÓN','SS26%','NOS%','FE%','CER%']
+    comp=df[df['COMPARABLE'].isin(['SI','SI - Reformada'])]
     return [['TOTALES'],[],[],hdr]+build_block(df)+[[],['COMPARABLES'],[],[],hdr]+build_block(comp)
 
 def calc_fac_tiendas(df):
     t=pneto(df,'tienda'); t.columns=['tienda',2026,2025,'dif neto']; return t
-
 def calc_fac_seccion(df):
     t=pneto(df,['tienda','seccion']); t.columns=['tienda','seccion',2026,2025,'DIF NETO']; return t
-
 def calc_gamas_comp(df):
     d=df[df['COMPARABLE'].isin(['SI','SI - Reformada'])]
     g26=d[d['fecha']==2026].groupby(['seccion','gama']).agg(N26=('neto','sum'),Q26=('qty','sum'))
@@ -119,105 +123,141 @@ def calc_gamas_comp(df):
     r['PM 25']=r.apply(lambda x:round(x['N25']/x['Q25'],2) if x['Q25'] else None,axis=1)
     r['DIF PM']=r.apply(lambda x:round(x['PM 26']-x['PM 25'],2) if pd.notna(x.get('PM 26')) and pd.notna(x.get('PM 25')) else None,axis=1)
     return r[['seccion','gama','N26','N25','DIF NETO','Q26','Q25','DIF QTY','PM 26','PM 25','DIF PM']].sort_values('N26',ascending=False).reset_index(drop=True)
-
 def calc_top_cia_cod(df):
     r=df.groupby(['fecha','seccion','temporada','Vender_en','gama','codart','articulo']).agg(neto=('neto','sum'),qty=('qty','sum')).reset_index()
     r.columns=['fecha','seccion','temporada','Vender_en','gama','codart','articulo','Suma de neto','Suma de qty']
     return r.sort_values('Suma de neto',ascending=False).reset_index(drop=True)
-
 def calc_gamas_tot(df):
     g26=df[df['fecha']==2026].groupby(['seccion','gama']).agg(N26=('neto','sum'),Q26=('qty','sum'))
     g25=df[df['fecha']==2025].groupby(['seccion','gama']).agg(N25=('neto','sum'),Q25=('qty','sum'))
     r=g26.join(g25,how='outer').fillna(0).reset_index()
     r['DIF NETO']=r['N26']-r['N25']; r['DIF QTY']=r['Q26']-r['Q25']
     return r[['seccion','gama','N26','N25','DIF NETO','Q26','Q25','DIF QTY']].sort_values('N26',ascending=False).reset_index(drop=True)
-
 def calc_gamas_tienda(df):
     g26=df[df['fecha']==2026].groupby(['tienda','seccion','gama']).agg(N26=('neto','sum'),Q26=('qty','sum'))
     g25=df[df['fecha']==2025].groupby(['tienda','seccion','gama']).agg(N25=('neto','sum'),Q25=('qty','sum'))
     r=g26.join(g25,how='outer').fillna(0).reset_index()
     r['DIF NETO']=r['N26']-r['N25']; r['DIF QTY']=r['Q26']-r['Q25']
     return r[['tienda','seccion','gama','N26','N25','DIF NETO','Q26','Q25','DIF QTY']].sort_values('N26',ascending=False).reset_index(drop=True)
-
 def calc_top_ventas_cia(df):
     r=df.groupby(['fecha','seccion','temporada','Vender_en','gama','codart','articulo','color']).agg(neto=('neto','sum'),qty=('qty','sum')).reset_index()
     r.columns=['fecha','seccion','temporada','Vender_en','gama','codart','articulo','color','Suma de neto','Suma de qty']
     return r.sort_values('Suma de neto',ascending=False).reset_index(drop=True)
-
 def calc_top_venta_tienda(df):
     r=df.groupby(['tienda','fecha','seccion','temporada','Vender_en','gama','codart','articulo','color']).agg(neto=('neto','sum'),qty=('qty','sum')).reset_index()
     r.columns=['tienda','fecha','seccion','temporada','Vender_en','gama','codart','articulo','color','Suma de neto','Suma de qty']
     return r.sort_values('Suma de neto',ascending=False).reset_index(drop=True)
-
 def calc_top_tienda_cod(df):
     r=df.groupby(['tienda','fecha','seccion','temporada','Vender_en','gama','codart','articulo']).agg(neto=('neto','sum'),qty=('qty','sum')).reset_index()
     r.columns=['tienda','fecha','seccion','temporada','Vender_en','gama','codart','articulo','Suma de neto','Suma de qty']
     return r.sort_values('Suma de neto',ascending=False).reset_index(drop=True)
 
-# ── Escritura Excel con formato ───────────────────────────────────────────────
-SHEET_COLS = {
-    'FACTURACIÓN TIENDAS':    [('tienda',47,None,False),(2026,13,FMT_EUR,False),(2025,13,FMT_EUR,False),('dif neto',13,FMT_EUR,True)],
-    'FACTURACIÓN SECCIÓN':    [('tienda',47,None,False),('seccion',16,None,False),(2026,13,FMT_EUR,False),(2025,13,FMT_EUR,False),('DIF NETO',13,FMT_EUR,True)],
-    'GAMAS CIA COMPARABLES':  [('seccion',14,None,False),('gama',17,None,False),('N26',13,FMT_EUR,False),('N25',13,FMT_EUR,False),('DIF NETO',12,FMT_EUR,True),('Q26',10,FMT_INT,False),('Q25',11,FMT_INT,False),('DIF QTY',11,FMT_INT,True),('PM 26',11,FMT_EUR,False),('PM 25',11,FMT_EUR,False),('DIF PM',11,FMT_EUR,True)],
-    'TOP CIA COD':            [('fecha',10,None,False),('seccion',14,None,False),('temporada',17,None,False),('Vender_en',17,None,False),('gama',15,None,False),('codart',12,None,False),('articulo',57,None,False),('Suma de neto',13,FMT_EUR,False),('Suma de qty',11,FMT_INT,False)],
-    'GAMAS CIA TOTALES':      [('seccion',14,None,False),('gama',17,None,False),('N26',13,FMT_EUR,False),('N25',13,FMT_EUR,False),('DIF NETO',12,FMT_EUR,True),('Q26',10,FMT_INT,False),('Q25',11,FMT_INT,False),('DIF QTY',11,FMT_INT,True)],
-    'GAMAS TIENDA':           [('tienda',47,None,False),('seccion',14,None,False),('gama',17,None,False),('N26',12,FMT_EUR,False),('N25',12,FMT_EUR,False),('DIF NETO',12,FMT_EUR,True),('Q26',10,FMT_INT,False),('Q25',11,FMT_INT,False),('DIF QTY',11,FMT_INT,True)],
-    'TOP VENTAS CIA':         [('fecha',10,None,False),('seccion',14,None,False),('temporada',17,None,False),('Vender_en',17,None,False),('gama',15,None,False),('codart',12,None,False),('articulo',57,None,False),('color',22,None,False),('Suma de neto',13,FMT_EUR,False),('Suma de qty',11,FMT_INT,False)],
-    'TOP VENTA TIENDA':       [('tienda',47,None,False),('fecha',10,None,False),('seccion',14,None,False),('temporada',17,None,False),('Vender_en',17,None,False),('gama',15,None,False),('codart',12,None,False),('articulo',57,None,False),('color',22,None,False),('Suma de neto',13,FMT_EUR,False),('Suma de qty',11,FMT_INT,False)],
-    'TOP TIENDA COD':         [('tienda',47,None,False),('fecha',10,None,False),('seccion',14,None,False),('temporada',17,None,False),('Vender_en',17,None,False),('gama',15,None,False),('codart',12,None,False),('articulo',57,None,False),('Suma de neto',13,FMT_EUR,False),('Suma de qty',11,FMT_INT,False)],
+# ── Escritura write_only con estilos ──────────────────────────────────────────
+SHEET_DEFS = {
+    'FACTURACIÓN TIENDAS':   [('tienda',47,None,False),(2026,13,FMT_EUR,False),(2025,13,FMT_EUR,False),('dif neto',13,FMT_EUR,True)],
+    'FACTURACIÓN SECCIÓN':   [('tienda',47,None,False),('seccion',16,None,False),(2026,13,FMT_EUR,False),(2025,13,FMT_EUR,False),('DIF NETO',13,FMT_EUR,True)],
+    'GAMAS CIA COMPARABLES': [('seccion',14,None,False),('gama',17,None,False),('N26',13,FMT_EUR,False),('N25',13,FMT_EUR,False),('DIF NETO',12,FMT_EUR,True),('Q26',10,FMT_INT,False),('Q25',11,FMT_INT,False),('DIF QTY',11,FMT_INT,True),('PM 26',11,FMT_EUR,False),('PM 25',11,FMT_EUR,False),('DIF PM',11,FMT_EUR,True)],
+    'TOP CIA COD':           [('fecha',10,None,False),('seccion',14,None,False),('temporada',17,None,False),('Vender_en',17,None,False),('gama',15,None,False),('codart',12,None,False),('articulo',57,None,False),('Suma de neto',13,FMT_EUR,False),('Suma de qty',11,FMT_INT,False)],
+    'GAMAS CIA TOTALES':     [('seccion',14,None,False),('gama',17,None,False),('N26',13,FMT_EUR,False),('N25',13,FMT_EUR,False),('DIF NETO',12,FMT_EUR,True),('Q26',10,FMT_INT,False),('Q25',11,FMT_INT,False),('DIF QTY',11,FMT_INT,True)],
+    'GAMAS TIENDA':          [('tienda',47,None,False),('seccion',14,None,False),('gama',17,None,False),('N26',12,FMT_EUR,False),('N25',12,FMT_EUR,False),('DIF NETO',12,FMT_EUR,True),('Q26',10,FMT_INT,False),('Q25',11,FMT_INT,False),('DIF QTY',11,FMT_INT,True)],
+    'TOP VENTAS CIA':        [('fecha',10,None,False),('seccion',14,None,False),('temporada',17,None,False),('Vender_en',17,None,False),('gama',15,None,False),('codart',12,None,False),('articulo',57,None,False),('color',22,None,False),('Suma de neto',13,FMT_EUR,False),('Suma de qty',11,FMT_INT,False)],
+    'TOP VENTA TIENDA':      [('tienda',47,None,False),('fecha',10,None,False),('seccion',14,None,False),('temporada',17,None,False),('Vender_en',17,None,False),('gama',15,None,False),('codart',12,None,False),('articulo',57,None,False),('color',22,None,False),('Suma de neto',13,FMT_EUR,False),('Suma de qty',11,FMT_INT,False)],
+    'TOP TIENDA COD':        [('tienda',47,None,False),('fecha',10,None,False),('seccion',14,None,False),('temporada',17,None,False),('Vender_en',17,None,False),('gama',15,None,False),('codart',12,None,False),('articulo',57,None,False),('Suma de neto',13,FMT_EUR,False),('Suma de qty',11,FMT_INT,False)],
 }
+
+def make_cell(ws, val, font, fill, align, number_format=None):
+    """Crea una WriteOnlyCell con estilo."""
+    c = WriteOnlyCell(ws, value=val)
+    c.font = font
+    if fill: c.fill = fill
+    if align: c.alignment = align
+    if number_format: c.number_format = number_format
+    return c
 
 def write_data_sheet(wb, name, df):
     ws = wb.create_sheet(name)
-    col_defs = SHEET_COLS[name]
-    for ci,(lbl,width,fmt,orange) in enumerate(col_defs,1):
-        c=ws.cell(1,ci,value=lbl)
-        c.fill=fill(ORG if orange else BLK); c.font=font(WHT,True); c.alignment=align()
-        ws.column_dimensions[get_column_letter(ci)].width=width
-    ws.row_dimensions[1].height=20; ws.freeze_panes='A2'
-    ws.auto_filter.ref=f'A1:{get_column_letter(len(col_defs))}1'
-    for ri,row in enumerate(df.itertuples(index=False),2):
-        alt=ri%2==0
-        for ci,(_,_,fmt,_) in enumerate(col_defs,1):
-            val=row[ci-1] if ci-1<len(row) else None
-            if val is pd.NA or (isinstance(val,float) and pd.isna(val)): val=None
-            c=ws.cell(ri,ci,value=val); c.font=font(); c.alignment=align()
-            if alt: c.fill=fill(GRY)
-            if fmt and val is not None: c.number_format=fmt
-            cn=str(col_defs[ci-1][0])
-            if 'DIF' in cn.upper() and isinstance(val,(int,float)) and val is not None:
-                c.fill=fill(GRN if val>0 else RED if val<0 else (GRY if alt else 'FFFFFF'))
+    col_defs = SHEET_DEFS[name]
+
+    # Anchos de columna (sí se pueden definir en write_only)
+    from openpyxl.worksheet.dimensions import ColumnDimension
+    for ci, (_, width, _, _) in enumerate(col_defs, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = width
+
+    # Cabecera
+    hdr_row = []
+    for lbl, _, _, orange in col_defs:
+        fnt, fil, aln = ST['hdr_org'] if orange else ST['hdr_blk']
+        hdr_row.append(make_cell(ws, lbl, fnt, fil, aln))
+    ws.append(hdr_row)
+
+    # Datos
+    for ri, row in enumerate(df.itertuples(index=False), 2):
+        alt = ri % 2 == 0
+        data_row = []
+        for ci, (col_name, _, fmt, _) in enumerate(col_defs):
+            val = row[ci] if ci < len(row) else None
+            if val is pd.NA or (isinstance(val, float) and pd.isna(val)): val = None
+
+            # Determinar estilo
+            is_dif = 'DIF' in str(col_name).upper()
+            if is_dif and isinstance(val, (int, float)) and val is not None:
+                fnt, fil, aln = ST['dif_grn'] if val > 0 else (ST['dif_red'] if val < 0 else (ST['alt_eur'] if alt else ST['dat_eur']))
+            elif fmt == FMT_EUR:
+                fnt, fil, aln = ST['alt_eur'] if alt else ST['dat_eur']
+            elif fmt == FMT_INT:
+                fnt, fil, aln = ST['alt_int'] if alt else ST['dat_int']
+            else:
+                fnt, fil, aln = ST['alt_txt'] if alt else ST['dat_txt']
+
+            c = WriteOnlyCell(ws, value=val)
+            c.font = fnt; c.alignment = aln
+            if fil: c.fill = fil
+            if fmt and val is not None: c.number_format = fmt
+            data_row.append(c)
+        ws.append(data_row)
 
 def write_resumen_sheet(wb, rows):
-    ws=wb.create_sheet('RESUMEN')
-    widths={'A':16,'B':14,'C':14,'D':12,'E':11,'G':16,'H':14,'I':13,'J':12,'K':12,'L':14,'N':13,'O':7,'P':7,'Q':7,'R':12}
-    for col,w in widths.items(): ws.column_dimensions[col].width=w
-    for ri,row in enumerate(rows,1):
-        if not row: continue
-        if row[0] in('TOTALES','COMPARABLES') and all(v is None for v in row[1:]):
-            ws.cell(ri,1,value=row[0]).font=font(BLK,True,13); continue
-        is_hdr=row[0]=='SECCIÓN'; is_tot=row[0]=='Total general'
-        for ci,val in enumerate(row,1):
-            if val is None: continue
-            c=ws.cell(ri,ci,value=val)
+    ws = wb.create_sheet('RESUMEN')
+    widths = {'A':16,'B':14,'C':14,'D':12,'E':11,'G':16,'H':14,'I':13,'J':12,'K':12,'L':14,'N':13,'O':7,'P':7,'Q':7,'R':12}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+
+    for row in rows:
+        if not row:
+            ws.append([None])
+            continue
+        if row[0] in ('TOTALES','COMPARABLES') and all(v is None for v in row[1:]):
+            fnt, fil, aln = ST['res_ttl']
+            c = WriteOnlyCell(ws, value=row[0]); c.font = fnt
+            ws.append([c]); continue
+
+        is_hdr = row[0] == 'SECCIÓN'
+        is_tot = row[0] == 'Total general'
+        out = []
+        for ci, val in enumerate(row, 1):
+            if val is None: out.append(None); continue
+            c = WriteOnlyCell(ws, value=val)
             if is_hdr:
-                c.fill=fill(BLK); c.font=font(WHT,True); c.alignment=align()
+                fnt,fil,aln = ST['res_hdr']; c.font=fnt; c.fill=fil; c.alignment=aln
             elif is_tot:
-                c.fill=fill(ORG); c.font=font(WHT,True); c.alignment=align()
-                if ci in(2,3,4,8,9,10,11,12): c.number_format=FMT_EUR
-                if ci==5 or ci in(15,16,17,18): c.number_format=FMT_PCT
+                fnt,fil,aln = ST['res_tot']; c.font=fnt; c.fill=fil; c.alignment=aln
+                if ci in (2,3,4,8,9,10,11,12): c.number_format=FMT_EUR
+                if ci==5 or ci in (15,16,17,18): c.number_format=FMT_PCT
             else:
-                c.font=font(); c.alignment=align()
-                if ci in(2,3,4,8,9,10,11,12): c.number_format=FMT_EUR
-                if ci==5 or ci in(15,16,17,18): c.number_format=FMT_PCT
+                fnt,fil,aln = ST['dat_txt']; c.font=fnt; c.alignment=aln
+                if ci in (2,3,4,8,9,10,11,12): c.number_format=FMT_EUR
+                if ci==5 or ci in (15,16,17,18): c.number_format=FMT_PCT
                 if ci==4 and isinstance(val,(int,float)):
-                    c.fill=fill(GRN if val>=0 else RED)
+                    c.fill = mk_fill(GRN if val>=0 else RED)
+            out.append(c)
+        ws.append(out)
 
 def generar_excel(df, tipo, semana, anio):
-    wb=Workbook(); wb.remove(wb.active)
+    wb = Workbook(write_only=True)
+
     write_resumen_sheet(wb, calc_resumen(df))
 
-    tabs=[
+    tabs = [
         ('FACTURACIÓN TIENDAS',   calc_fac_tiendas),
         ('FACTURACIÓN SECCIÓN',   calc_fac_seccion),
         ('GAMAS CIA COMPARABLES', calc_gamas_comp),
@@ -231,9 +271,10 @@ def generar_excel(df, tipo, semana, anio):
     for name, fn in tabs:
         result = fn(df)
         write_data_sheet(wb, name, result)
-        del result; gc.collect()  # liberar memoria tras cada pestaña
+        del result; gc.collect()
 
-    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
+    buf = io.BytesIO()
+    wb.save(buf); buf.seek(0)
     del wb; gc.collect()
     return buf, f'PESOS_{tipo}_W{semana:02d}_{anio}.xlsx'
 
@@ -307,24 +348,15 @@ main{max-width:760px;margin:0 auto;padding:36px 20px 80px}
     <div class="wlbl"><label>Año</label><input type="number" id="ianio" min="2020" max="2099" value="{{ anio }}"/></div>
   </div>
   <div class="drop-grid">
-    <div class="dz" id="dz-fp">
-      <input type="file" id="f-fp" accept=".xlsx,.xls"/>
-      <div class="dz-icon">📋</div><div class="dz-lbl">Maestro Full Price</div>
-      <div class="dz-sub">Arrastra aquí o haz clic</div>
-    </div>
-    <div class="dz" id="dz-out">
-      <input type="file" id="f-out" accept=".xlsx,.xls"/>
-      <div class="dz-icon">🏪</div><div class="dz-lbl">Maestro Outlet</div>
-      <div class="dz-sub">Arrastra aquí o haz clic</div>
-      <div class="dz-opt">opcional</div>
-    </div>
+    <div class="dz" id="dz-fp"><input type="file" id="f-fp" accept=".xlsx,.xls"/>
+      <div class="dz-icon">📋</div><div class="dz-lbl">Maestro Full Price</div><div class="dz-sub">Arrastra aquí o haz clic</div></div>
+    <div class="dz" id="dz-out"><input type="file" id="f-out" accept=".xlsx,.xls"/>
+      <div class="dz-icon">🏪</div><div class="dz-lbl">Maestro Outlet</div><div class="dz-sub">Arrastra aquí o haz clic</div><div class="dz-opt">opcional</div></div>
   </div>
   <div class="fmt-bar">
     <span>FORMATO:</span>
-    <span class="chip c-blk">Cabeceras negras</span>
-    <span class="chip c-org">DIF naranja</span>
-    <span class="chip c-grn">▲ Positivo</span>
-    <span class="chip c-red">▼ Negativo</span>
+    <span class="chip c-blk">Cabeceras negras</span><span class="chip c-org">DIF naranja</span>
+    <span class="chip c-grn">▲ Positivo</span><span class="chip c-red">▼ Negativo</span>
   </div>
   <div id="err"></div>
   <div id="prog">
@@ -336,13 +368,11 @@ main{max-width:760px;margin:0 auto;padding:36px 20px 80px}
   <div class="results" id="results"></div>
 </main>
 <script>
-const files={};
-const $=id=>document.getElementById(id);
+const files={};const $=id=>document.getElementById(id);
 function upPill(){$('wpill').textContent=`W${String($('isem').value).padStart(2,'0')} · ${$('ianio').value}`;}
 function chkReady(){$('btn').disabled=!Object.keys(files).length;}
 function showErr(m){const e=$('err');e.textContent=m;e.style.display='block';}
 function hideErr(){$('err').style.display='none';}
-
 function setupDz(key){
   const dz=$(`dz-${key}`);
   dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('over');});
@@ -351,8 +381,7 @@ function setupDz(key){
   $(`f-${key}`).addEventListener('change',e=>{if(e.target.files[0])setFile(e.target.files[0],key);});
 }
 function setFile(file,key){
-  files[key]=file;
-  const dz=$(`dz-${key}`);dz.classList.add('loaded');
+  files[key]=file;const dz=$(`dz-${key}`);dz.classList.add('loaded');
   dz.innerHTML=`<button class="dz-clr" onclick="clrFile('${key}')">✕</button>
     <input type="file" id="f-${key}" accept=".xlsx,.xls"/>
     <div class="dz-icon">${key==='fp'?'📋':'🏪'}</div>
@@ -363,8 +392,7 @@ function setFile(file,key){
   hideErr();chkReady();
 }
 function clrFile(key){
-  delete files[key];
-  const dz=$(`dz-${key}`);dz.classList.remove('loaded');
+  delete files[key];const dz=$(`dz-${key}`);dz.classList.remove('loaded');
   dz.innerHTML=`<input type="file" id="f-${key}" accept=".xlsx,.xls"/>
     <div class="dz-icon">${key==='fp'?'📋':'🏪'}</div>
     <div class="dz-lbl">${key==='fp'?'Maestro Full Price':'Maestro Outlet'}</div>
@@ -375,83 +403,60 @@ function clrFile(key){
 }
 setupDz('fp');setupDz('out');
 $('isem').addEventListener('input',upPill);$('ianio').addEventListener('input',upPill);upPill();
-
-let progInterval=null;
-function startFakeProgress(){
-  let p=5;
-  $('prog-fill').style.width='5%';
-  progInterval=setInterval(()=>{
-    if(p<90){p+=Math.random()*3;$('prog-fill').style.width=Math.min(p,90)+'%';}
-  },800);
-}
-function stopProgress(){
-  clearInterval(progInterval);
-  $('prog-fill').style.width='100%';
-}
-
+let ti=null;
+function startProg(){let p=5;$('prog-fill').style.width='5%';ti=setInterval(()=>{if(p<88){p+=Math.random()*2;$('prog-fill').style.width=p+'%';}},1000);}
+function stopProg(){clearInterval(ti);$('prog-fill').style.width='100%';}
 $('btn').addEventListener('click',async()=>{
-  hideErr();$('results').innerHTML='';
-  $('btn').disabled=true;$('prog').style.display='block';
-  startFakeProgress();
-  const sem=$('isem').value,anio=$('ianio').value;
-  const resultCards=[];
+  hideErr();$('results').innerHTML='';$('btn').disabled=true;$('prog').style.display='block';startProg();
+  const sem=$('isem').value,anio=$('ianio').value,cards=[];
   try{
     for(const[key,file]of Object.entries(files)){
       const tipo=key==='fp'?'FULL_PRICE':'OUTLET';
       $('prog-lbl').textContent=`Generando ${tipo}... puede tardar 1-2 minutos`;
-      const fd=new FormData();
-      fd.append('file',file);fd.append('tipo',tipo);
-      fd.append('semana',sem);fd.append('anio',anio);
+      const fd=new FormData();fd.append('file',file);fd.append('tipo',tipo);fd.append('semana',sem);fd.append('anio',anio);
       const resp=await fetch('/generar',{method:'POST',body:fd});
-      if(!resp.ok){const t=await resp.text();throw new Error(t);}
+      if(!resp.ok){throw new Error(await resp.text());}
       const blob=await resp.blob();
       const fname=`PESOS_${tipo}_W${String(sem).padStart(2,'0')}_${anio}.xlsx`;
-      resultCards.push({key,tipo,fname,url:URL.createObjectURL(blob)});
+      cards.push({key,tipo,fname,url:URL.createObjectURL(blob)});
     }
-    stopProgress();
-    setTimeout(()=>{$('prog').style.display='none';},400);
-    $('results').innerHTML=resultCards.map(({key,tipo,fname,url})=>`
+    stopProg();setTimeout(()=>$('prog').style.display='none',400);
+    $('results').innerHTML=cards.map(({key,tipo,fname,url})=>`
       <div class="result-card">
-        <div class="result-info">
-          <span class="result-icon">${key==='fp'?'📋':'🏪'}</span>
+        <div class="result-info"><span class="result-icon">${key==='fp'?'📋':'🏪'}</span>
           <div><div class="result-name">${fname}</div>
-          <div class="result-sub">${tipo==='FULL_PRICE'?'Full Price':'Outlet'} · 10 pestañas formateadas</div></div>
-        </div>
+          <div class="result-sub">${tipo==='FULL_PRICE'?'Full Price':'Outlet'} · 10 pestañas formateadas</div></div></div>
         <a class="btn-dl" href="${url}" download="${fname}">↓ Descargar</a>
       </div>`).join('');
-  }catch(err){
-    stopProgress();$('prog').style.display='none';
-    showErr('Error: '+err.message);
-  }
+  }catch(err){stopProg();$('prog').style.display='none';showErr('Error: '+err.message);}
   $('btn').disabled=false;
 });
 </script>
 </body>
 </html>'''
 
-# ── Rutas ─────────────────────────────────────────────────────────────────────
 @app.route('/')
 def index():
     now=datetime.now()
-    return render_template_string(HTML, sem=now.isocalendar()[1], anio=now.year)
+    return render_template_string(HTML,sem=now.isocalendar()[1],anio=now.year)
 
-@app.route('/generar', methods=['POST'])
+@app.route('/generar',methods=['POST'])
 def generar():
     try:
-        file  = request.files.get('file')
-        tipo  = request.form.get('tipo','FULL_PRICE')
-        sem   = int(request.form.get('semana',1))
-        anio  = int(request.form.get('anio',datetime.now().year))
+        file=request.files.get('file')
+        tipo=request.form.get('tipo','FULL_PRICE')
+        sem=int(request.form.get('semana',1))
+        anio=int(request.form.get('anio',datetime.now().year))
         if not file: return 'No se recibió ningún archivo',400
-        df = load_maestro(file)
+        df=load_maestro(file)
         if len(df)==0: return 'El archivo no tiene datos válidos',400
-        buf, fname = generar_excel(df, tipo, sem, anio)
-        del df; gc.collect()
+        buf,fname=generar_excel(df,tipo,sem,anio)
+        del df;gc.collect()
         return send_file(buf,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True, download_name=fname)
+            as_attachment=True,download_name=fname)
     except Exception as e:
-        return str(e), 500
+        return str(e),500
 
 if __name__=='__main__':
     port=int(os.environ.get('PORT',5000))
