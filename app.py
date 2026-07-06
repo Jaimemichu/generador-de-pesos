@@ -179,11 +179,14 @@ def procesar(job_id, file_bytes, tipo, semana, anio):
         buf, fname = generar_excel(M, tipo, semana, anio)
         del M; gc.collect()
 
+        import base64
+        b64 = base64.b64encode(buf.read()).decode('ascii')
+        del buf; gc.collect()
         upd(100, 'Listo')
         with JOBS_LOCK:
-            JOBS[job_id]['status']     = 'done'
-            JOBS[job_id]['result_buf'] = buf
-            JOBS[job_id]['fname']      = fname
+            JOBS[job_id]['status'] = 'done'
+            JOBS[job_id]['b64']    = b64
+            JOBS[job_id]['fname']  = fname
 
     except Exception as e:
         tb = traceback.format_exc()
@@ -390,7 +393,7 @@ def iniciar():
     with JOBS_LOCK:
         JOBS[job_id] = {
             'status':'running', 'progress':0,
-            'message':'Iniciando...', 'result_buf':None,
+            'message':'Iniciando...', 'b64':None,
             'fname':None, 'error':None, 'ts':time.time()
         }
 
@@ -403,13 +406,16 @@ def estado(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     if not job: return jsonify(error='Job no encontrado'),404
-    return jsonify(
+    resp = dict(
         status   = job['status'],
         progress = job['progress'],
         message  = job['message'],
         fname    = job['fname'],
         error    = job['error']
     )
+    if job['status'] == 'done':
+        resp['b64'] = job.get('b64','')
+    return jsonify(resp)
 
 @app.route('/descargar/<job_id>')
 def descargar(job_id):
@@ -562,7 +568,7 @@ async function waitForJob(jobId,icon,tipo,sem,anio){
         setProg(j.progress, j.message);
         if(j.status==='done'){
           clearInterval(poll);
-          resolve({jobId,icon,tipo,fname:j.fname,sem,anio});
+          resolve({jobId,icon,tipo,fname:j.fname,b64:j.b64,sem,anio});
         } else if(j.status==='error'){
           clearInterval(poll);
           reject(new Error(j.error||'Error desconocido'));
@@ -606,13 +612,22 @@ $('btn').addEventListener('click',async()=>{
     setProg(100,'¡Listo!');
     setTimeout(()=>$('prog').style.display='none',400);
 
-    $('results').innerHTML=results.map(({jobId,icon,tipo,fname})=>`
+    $('results').innerHTML=results.map(({jobId,icon,tipo,fname,b64})=>`
       <div class="rc">
         <div class="ri"><span class="ricon">${icon}</span>
           <div><div class="rname">${fname}</div>
           <div class="rsub">${tipo==='FULL_PRICE'?'Full Price':'Outlet'} · 10 pestañas</div></div></div>
-        <a class="dl" href="/descargar/${jobId}" download="${fname}">↓ Descargar</a>
+        <a class="dl" id="dl-${jobId}" download="${fname}">↓ Descargar</a>
       </div>`).join('');
+  // Crear blob URLs desde base64 y asignar a los botones
+  results.forEach(({jobId,fname,b64})=>{
+    const bytes=atob(b64);
+    const arr=new Uint8Array(bytes.length);
+    for(let i=0;i<bytes.length;i++) arr[i]=bytes.charCodeAt(i);
+    const blob=new Blob([arr],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    const el=document.getElementById('dl-'+jobId);
+    if(el) el.href=URL.createObjectURL(blob);
+  });
   }catch(err){
     $('prog').style.display='none';
     showErr('Error: '+err.message);
