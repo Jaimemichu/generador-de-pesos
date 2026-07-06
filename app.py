@@ -1,24 +1,37 @@
 """
-app.py — Generador PESOS
-Lee el xlsx en modo streaming (openpyxl read_only) sin pandas.
-Acumula en dicts en un único pase.
-Escribe el resultado en modo write_only.
-RAM total: ~150 MB para maestro de 153k filas.
+app.py — Generador PESOS con procesamiento asíncrono
+Flujo:
+  1. POST /iniciar   → guarda el fichero, lanza hilo, devuelve job_id (rápido)
+  2. GET  /estado/<id> → devuelve progreso o "listo"
+  3. GET  /descargar/<id> → devuelve el xlsx generado
 """
-from flask import Flask, request, send_file, render_template_string
+from flask import Flask, request, send_file, render_template_string, jsonify
 import openpyxl
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.cell import WriteOnlyCell
 from collections import defaultdict
-import io, os, gc
+import io, os, gc, uuid, threading, time, traceback
 from datetime import datetime
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 
-# ── Estilos (pre-construidos, reutilizados) ───────────────────────────────────
+# ── Store de trabajos en memoria ──────────────────────────────────────────────
+# {job_id: {status, progress, message, result_buf, fname, error, ts}}
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+def cleanup_old_jobs():
+    """Elimina trabajos con más de 1 hora."""
+    now = time.time()
+    with JOBS_LOCK:
+        old = [jid for jid, j in JOBS.items() if now - j['ts'] > 3600]
+        for jid in old:
+            del JOBS[jid]
+
+# ── Estilos ───────────────────────────────────────────────────────────────────
 BLK='000000';WHT='FFFFFF';ORG='E97132';GRY='F2F2F2';GRN='C6EFCE';RED='FFC7CE'
 FMT_EUR='_-* #,##0.00\\ "€"_-;\\-* #,##0.00\\ "€"_-;_-* "-"??\\ "€"_-;_-@_-'
 FMT_INT='#,##0'; FMT_PCT='0.0%'
@@ -36,124 +49,158 @@ ST={
     'rT':(mn(BLK,True,13),None,None), 'rH':(mn(WHT,True),mf(BLK),ma()),
     'rO':(mn(WHT,True),mf(ORG),ma()),
 }
-
 r2=lambda n:round(float(n),2) if n is not None else None
 
-# ── Columnas necesarias ───────────────────────────────────────────────────────
 COLS=['tienda','COMPARABLE','temporada','Vender_en','seccion','gama',
       'articulo','codart','color','neto','qty','fecha']
 
 def mvend(v):
     if v=='SS26': return'SS26'
     if v=='NOS CONTINUATIVO': return'NOS'
-    if v=='FIN EXISTENCIAS':  return'FE'
-    if v=='CEREMONIA':        return'CEREMONIA'
+    if v=='FIN EXISTENCIAS': return'FE'
+    if v=='CEREMONIA': return'CEREMONIA'
     return None
 
-# ── Lectura streaming + acumulación en un único pase ─────────────────────────
-def read_and_accumulate(file_obj):
-    wb=openpyxl.load_workbook(file_obj,read_only=True,data_only=True)
-    # Detectar hoja: preferir 'maestro full price' o 'maestro outlet', sino la primera
-    sheet_name=wb.sheetnames[0]
-    for sn in wb.sheetnames:
-        if 'maestro' in sn.lower() or 'full' in sn.lower() or 'outlet' in sn.lower():
-            sheet_name=sn; break
-    ws=wb[sheet_name]
-    rows=ws.iter_rows(values_only=True)
-    header=[str(h).strip() if h else '' for h in next(rows)]
+# ── Procesamiento (se ejecuta en hilo) ────────────────────────────────────────
+def procesar(job_id, file_bytes, tipo, semana, anio):
+    def upd(p, msg):
+        with JOBS_LOCK:
+            JOBS[job_id]['progress'] = p
+            JOBS[job_id]['message']  = msg
 
-    def fi(name):
-        for i,h in enumerate(header):
-            if h.lower()==name.lower(): return i
-        return -1
+    try:
+        upd(5, 'Leyendo archivo...')
 
-    I={c:fi(c) for c in COLS}
-    missing=[c for c in COLS if I[c]<0]
-    if missing: raise ValueError(f'Columnas no encontradas: {missing}')
+        # ── Lectura streaming ────────────────────────────────────────────────
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        sheet_name = wb.sheetnames[0]
+        for sn in wb.sheetnames:
+            if any(x in sn.lower() for x in ['maestro','full','outlet']):
+                sheet_name = sn; break
+        ws = wb[sheet_name]
+        rows_iter = ws.iter_rows(values_only=True)
+        header = [str(h).strip() if h else '' for h in next(rows_iter)]
 
-    # Acumuladores [neto26,qty26,neto25,qty25]
-    mFT=defaultdict(lambda:[0.,0.,0.,0.])
-    mFS=defaultdict(lambda:[0.,0.,0.,0.])
-    mGC=defaultdict(lambda:[0.,0.,0.,0.])
-    mGT=defaultdict(lambda:[0.,0.,0.,0.])
-    mGTd=defaultdict(lambda:[0.,0.,0.,0.])
-    mRS=defaultdict(lambda:[0.,0.])
-    mRST=defaultdict(float)
-    mRC=defaultdict(lambda:[0.,0.])
-    mRCT=defaultdict(float)
-    mTC={}; mTV={}; mVT={}; mTTc={}
+        def fi(name):
+            for i,h in enumerate(header):
+                if h.lower() == name.lower(): return i
+            return -1
 
-    def acc(d,k,n,q,f):
-        e=d[k]
-        if f==2026: e[0]+=n;e[1]+=q
-        else:       e[2]+=n;e[3]+=q
+        I = {c: fi(c) for c in COLS}
+        missing = [c for c in COLS if I[c] < 0]
+        if missing:
+            raise ValueError(f'Columnas no encontradas: {missing}')
 
-    def acT(d,k,n,q,dims):
-        if k not in d: d[k]=[0.,0.]+list(dims)
-        d[k][0]+=n; d[k][1]+=q
+        # Acumuladores
+        mFT=defaultdict(lambda:[0.,0.,0.,0.])
+        mFS=defaultdict(lambda:[0.,0.,0.,0.])
+        mGC=defaultdict(lambda:[0.,0.,0.,0.])
+        mGT=defaultdict(lambda:[0.,0.,0.,0.])
+        mGTd=defaultdict(lambda:[0.,0.,0.,0.])
+        mRS=defaultdict(lambda:[0.,0.])
+        mRST=defaultdict(float)
+        mRC=defaultdict(lambda:[0.,0.])
+        mRCT=defaultdict(float)
+        mTC={}; mTV={}; mVT={}; mTTc={}
 
-    for row in rows:
-        try:
-            fecha=int(row[I['fecha']] or 0)
-            if fecha not in(2025,2026): continue
-            td  =str(row[I['tienda']]    or'').strip()
-            comp=str(row[I['COMPARABLE']] or'').strip()
-            if comp in('0','None','nan'): comp=''
-            tmp =str(row[I['temporada']] or'').strip()
-            vnd =str(row[I['Vender_en']] or'').strip()
-            sec =str(row[I['seccion']]   or'').strip()
-            gam =str(row[I['gama']]      or'').strip()
-            art =str(row[I['articulo']]  or'').strip()
-            cod =str(row[I['codart']]    or'').strip()
-            col =str(row[I['color']]     or'').strip()
-            neto=float(row[I['neto']]    or 0)
-            qty =float(row[I['qty']]     or 0)
-            isC =comp in('SI','SI - Reformada')
+        def acc(d,k,n,q,f):
+            e=d[k]
+            if f==2026: e[0]+=n;e[1]+=q
+            else:       e[2]+=n;e[3]+=q
 
-            acc(mFT, td,                 neto,qty,fecha)
-            acc(mFS, f'{td}|{sec}',      neto,qty,fecha)
-            if isC: acc(mGC,f'{sec}|{gam}',neto,qty,fecha)
-            acc(mGT, f'{sec}|{gam}',     neto,qty,fecha)
-            acc(mGTd,f'{td}|{sec}|{gam}',neto,qty,fecha)
+        def acT(d,k,n,q,dims):
+            if k not in d: d[k]=[0.,0.]+list(dims)
+            d[k][0]+=n; d[k][1]+=q
 
-            r=mRS[sec]
-            if fecha==2026: r[0]+=neto
-            else:           r[1]+=neto
-            if fecha==2026:
-                tg=mvend(vnd)
-                if tg: mRST[f'{sec}|{tg}']+=neto
-            if isC:
-                r=mRC[sec]
+        upd(10, 'Procesando datos...')
+        count = 0
+        for row in rows_iter:
+            try:
+                fecha=int(row[I['fecha']] or 0)
+                if fecha not in (2025,2026): continue
+                td  =str(row[I['tienda']]     or'').strip()
+                comp=str(row[I['COMPARABLE']] or'').strip()
+                if comp in('0','None','nan'): comp=''
+                tmp =str(row[I['temporada']]  or'').strip()
+                vnd =str(row[I['Vender_en']]  or'').strip()
+                sec =str(row[I['seccion']]    or'').strip()
+                gam =str(row[I['gama']]       or'').strip()
+                art =str(row[I['articulo']]   or'').strip()
+                cod =str(row[I['codart']]      or'').strip()
+                col =str(row[I['color']]      or'').strip()
+                neto=float(row[I['neto']]     or 0)
+                qty =float(row[I['qty']]      or 0)
+                isC =comp in('SI','SI - Reformada')
+
+                acc(mFT, td,                 neto,qty,fecha)
+                acc(mFS, f'{td}|{sec}',      neto,qty,fecha)
+                if isC: acc(mGC,f'{sec}|{gam}',neto,qty,fecha)
+                acc(mGT, f'{sec}|{gam}',     neto,qty,fecha)
+                acc(mGTd,f'{td}|{sec}|{gam}',neto,qty,fecha)
+
+                r=mRS[sec]
                 if fecha==2026: r[0]+=neto
                 else:           r[1]+=neto
                 if fecha==2026:
                     tg=mvend(vnd)
-                    if tg: mRCT[f'{sec}|{tg}']+=neto
+                    if tg: mRST[f'{sec}|{tg}']+=neto
+                if isC:
+                    r=mRC[sec]
+                    if fecha==2026: r[0]+=neto
+                    else:           r[1]+=neto
+                    if fecha==2026:
+                        tg=mvend(vnd)
+                        if tg: mRCT[f'{sec}|{tg}']+=neto
 
-            acT(mTC, f'{fecha}|{sec}|{tmp}|{vnd}|{gam}|{cod}|{art}',
-                neto,qty,[fecha,sec,tmp,vnd,gam,cod,art])
-            acT(mTV, f'{fecha}|{sec}|{tmp}|{vnd}|{gam}|{cod}|{art}|{col}',
-                neto,qty,[fecha,sec,tmp,vnd,gam,cod,art,col])
-            acT(mVT, f'{td}|{fecha}|{sec}|{tmp}|{vnd}|{gam}|{cod}|{art}|{col}',
-                neto,qty,[td,fecha,sec,tmp,vnd,gam,cod,art,col])
-            acT(mTTc,f'{td}|{fecha}|{sec}|{tmp}|{vnd}|{gam}|{cod}|{art}',
-                neto,qty,[td,fecha,sec,tmp,vnd,gam,cod,art])
-        except: pass
+                acT(mTC, f'{fecha}|{sec}|{tmp}|{vnd}|{gam}|{cod}|{art}',
+                    neto,qty,[fecha,sec,tmp,vnd,gam,cod,art])
+                acT(mTV, f'{fecha}|{sec}|{tmp}|{vnd}|{gam}|{cod}|{art}|{col}',
+                    neto,qty,[fecha,sec,tmp,vnd,gam,cod,art,col])
+                acT(mVT, f'{td}|{fecha}|{sec}|{tmp}|{vnd}|{gam}|{cod}|{art}|{col}',
+                    neto,qty,[td,fecha,sec,tmp,vnd,gam,cod,art,col])
+                acT(mTTc,f'{td}|{fecha}|{sec}|{tmp}|{vnd}|{gam}|{cod}|{art}',
+                    neto,qty,[td,fecha,sec,tmp,vnd,gam,cod,art])
+                count+=1
+            except: pass
 
-    wb.close()
-    return dict(mFT=mFT,mFS=mFS,mGC=mGC,mGT=mGT,mGTd=mGTd,
-                mRS=mRS,mRST=mRST,mRC=mRC,mRCT=mRCT,
-                mTC=mTC,mTV=mTV,mVT=mVT,mTTc=mTTc)
+            if count % 20000 == 0:
+                upd(10 + min(40, count//3000), f'Procesando... {count:,} filas')
 
-# ── Generación de AOAs desde los acumuladores ─────────────────────────────────
+        wb.close()
+        del file_bytes; gc.collect()
+        upd(55, 'Calculando pestañas...')
+
+        M=dict(mFT=mFT,mFS=mFS,mGC=mGC,mGT=mGT,mGTd=mGTd,
+               mRS=mRS,mRST=mRST,mRC=mRC,mRCT=mRCT,
+               mTC=mTC,mTV=mTV,mVT=mVT,mTTc=mTTc)
+
+        # ── Escritura ────────────────────────────────────────────────────────
+        upd(60, 'Generando Excel...')
+        buf, fname = generar_excel(M, tipo, semana, anio)
+        del M; gc.collect()
+
+        upd(100, 'Listo')
+        with JOBS_LOCK:
+            JOBS[job_id]['status']     = 'done'
+            JOBS[job_id]['result_buf'] = buf
+            JOBS[job_id]['fname']      = fname
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        with JOBS_LOCK:
+            JOBS[job_id]['status']  = 'error'
+            JOBS[job_id]['error']   = str(e)
+            JOBS[job_id]['message'] = str(e)
+        print(f"ERROR job {job_id}:\n{tb}")
+
+# ── AOAs ──────────────────────────────────────────────────────────────────────
 def aoa_resumen(mRS,mRST,mRC,mRCT):
     TC=['SS26','NOS','FE','CEREMONIA']
     def block(mS,mST):
         tot26=sum(e[0] for e in mS.values())
-        secs=sorted(mS.keys(),key=lambda s:-mS[s][0])
         rows=[]
-        for sec in secs:
-            e=mS[sec]; n26=r2(e[0]); n25=r2(e[1])
+        for sec in sorted(mS,key=lambda s:-mS[s][0]):
+            e=mS[sec];n26=r2(e[0]);n25=r2(e[1])
             pct=round(n26/tot26,4) if tot26 else 0
             ts=[r2(mST.get(f'{sec}|{tc}',0)) for tc in TC]
             tp=[round(t/n26,4) if n26 else 0 for t in ts]
@@ -165,9 +212,8 @@ def aoa_resumen(mRS,mRST,mRC,mRCT):
         rows.append(['Total general',tn26,tn25,r2(tn26-tn25),1.0,
                      None,'Total general']+tt+[r2(sum(tt)),None,'Total general']+ttp)
         return rows
-    hdr=['SECCIÓN',2026,2025,'DIF NETO','%',None,
-         'SECCIÓN','SS26','NOS','FE','CEREMONIA','Total',None,
-         'SECCIÓN','SS26%','NOS%','FE%','CER%']
+    hdr=['SECCIÓN',2026,2025,'DIF NETO','%',None,'SECCIÓN','SS26','NOS','FE','CEREMONIA','Total',
+         None,'SECCIÓN','SS26%','NOS%','FE%','CER%']
     return [['TOTALES'],[],[],hdr]+block(mRS,mRST)+\
            [[],['COMPARABLES'],[],[],hdr]+block(mRC,mRCT)
 
@@ -212,7 +258,8 @@ def aoa_gama_tot(m):
 def aoa_gama_tienda(m):
     rows=[['tienda','seccion','gama','NETO 26','NETO 25','DIF NETO','QTY 26','QTY 25','DIF QTY']]
     for k,e in sorted(m.items(),key=lambda x:-x[1][0]):
-        parts=k.split('|',2);td=parts[0];sec=parts[1];gam=parts[2] if len(parts)>2 else ''
+        parts=k.split('|',2)
+        td=parts[0];sec=parts[1];gam=parts[2] if len(parts)>2 else ''
         n26=r2(e[0]);n25=r2(e[2]);q26=round(e[1]);q25=round(e[3])
         rows.append([td,sec,gam,n26,n25,r2(n26-n25),q26,q25,q26-q25])
     return rows
@@ -248,8 +295,8 @@ SHEET_DEFS={
     'TOP TIENDA COD':        [('tienda',47,None,False),('fecha',10,None,False),('seccion',14,None,False),('temporada',17,None,False),('Vender_en',17,None,False),('gama',15,None,False),('codart',12,None,False),('articulo',57,None,False),('Suma de neto',13,FMT_EUR,False),('Suma de qty',11,FMT_INT,False)],
 }
 
-def wc(ws,val,st_key,fmt=None):
-    fnt,fil,aln=ST[st_key]
+def wc(ws,val,sk,fmt=None):
+    fnt,fil,aln=ST[sk]
     c=WriteOnlyCell(ws,value=val)
     c.font=fnt
     if fil: c.fill=fil
@@ -262,18 +309,12 @@ def write_data_sheet(wb,name,aoa):
     col_defs=SHEET_DEFS[name]
     for ci,(_,w,_,_) in enumerate(col_defs,1):
         ws.column_dimensions[get_column_letter(ci)].width=w
-    # Cabecera (fila 0 del aoa)
-    hdr_row=[]
-    for lbl,_,_,orange in col_defs:
-        hdr_row.append(wc(ws,lbl,'hO' if orange else 'hB'))
-    ws.append(hdr_row)
-    # Datos
+    ws.append([wc(ws,lbl,'hO' if orange else 'hB') for lbl,_,_,orange in col_defs])
     for ri,row in enumerate(aoa[1:],2):
-        alt=ri%2==0
-        out=[]
-        for ci,(col_name,_,fmt,_) in enumerate(col_defs):
+        alt=ri%2==0; out=[]
+        for ci,(cn,_,fmt,_) in enumerate(col_defs):
             val=row[ci] if ci<len(row) else None
-            is_dif='DIF' in str(col_name).upper()
+            is_dif='DIF' in str(cn).upper()
             if is_dif and isinstance(val,(int,float)) and val is not None:
                 sk='dG' if val>0 else('dR' if val<0 else('aE' if alt else 'eu'))
             elif fmt==FMT_EUR: sk='aE' if alt else 'eu'
@@ -284,14 +325,13 @@ def write_data_sheet(wb,name,aoa):
 
 def write_resumen(wb,aoa):
     ws=wb.create_sheet('RESUMEN')
-    widths={'A':16,'B':14,'C':14,'D':12,'E':11,'G':16,'H':14,'I':13,'J':12,'K':12,'L':14,'N':13,'O':7,'P':7,'Q':7,'R':12}
-    for col,w in widths.items(): ws.column_dimensions[col].width=w
+    for col,w in {'A':16,'B':14,'C':14,'D':12,'E':11,'G':16,'H':14,'I':13,'J':12,'K':12,'L':14,'N':13,'O':7,'P':7,'Q':7,'R':12}.items():
+        ws.column_dimensions[col].width=w
     for row in aoa:
         if not row: ws.append([None]); continue
         if row[0] in('TOTALES','COMPARABLES') and all(v is None for v in row[1:]):
             c=WriteOnlyCell(ws,value=row[0]); c.font=ST['rT'][0]; ws.append([c]); continue
-        is_hdr=row[0]=='SECCIÓN'; is_tot=row[0]=='Total general'
-        out=[]
+        is_hdr=row[0]=='SECCIÓN'; is_tot=row[0]=='Total general'; out=[]
         for ci,val in enumerate(row,1):
             if val is None: out.append(None); continue
             if is_hdr:   c=wc(ws,val,'rH')
@@ -311,23 +351,77 @@ def write_resumen(wb,aoa):
 def generar_excel(M,tipo,semana,anio):
     wb=Workbook(write_only=True)
     write_resumen(wb,aoa_resumen(M['mRS'],M['mRST'],M['mRC'],M['mRCT']))
-    tabs=[
-        ('FACTURACIÓN TIENDAS',   aoa_fac_tienda(M['mFT'])),
-        ('FACTURACIÓN SECCIÓN',   aoa_fac_sec(M['mFS'])),
-        ('GAMAS CIA COMPARABLES', aoa_gama_comp(M['mGC'])),
-        ('TOP CIA COD',           aoa_top_cod(M['mTC'])),
-        ('GAMAS CIA TOTALES',     aoa_gama_tot(M['mGT'])),
-        ('GAMAS TIENDA',          aoa_gama_tienda(M['mGTd'])),
-        ('TOP VENTAS CIA',        aoa_top_vent_cia(M['mTV'])),
-        ('TOP VENTA TIENDA',      aoa_top_venta_tienda(M['mVT'])),
-        ('TOP TIENDA COD',        aoa_top_tienda_cod(M['mTTc'])),
-    ]
-    for name,aoa in tabs:
-        write_data_sheet(wb,name,aoa)
-        del aoa; gc.collect()
+    for name,fn,key in [
+        ('FACTURACIÓN TIENDAS',   aoa_fac_tienda,      'mFT'),
+        ('FACTURACIÓN SECCIÓN',   aoa_fac_sec,         'mFS'),
+        ('GAMAS CIA COMPARABLES', aoa_gama_comp,       'mGC'),
+        ('TOP CIA COD',           aoa_top_cod,         'mTC'),
+        ('GAMAS CIA TOTALES',     aoa_gama_tot,        'mGT'),
+        ('GAMAS TIENDA',          aoa_gama_tienda,     'mGTd'),
+        ('TOP VENTAS CIA',        aoa_top_vent_cia,    'mTV'),
+        ('TOP VENTA TIENDA',      aoa_top_venta_tienda,'mVT'),
+        ('TOP TIENDA COD',        aoa_top_tienda_cod,  'mTTc'),
+    ]:
+        aoa=fn(M[key]); write_data_sheet(wb,name,aoa); del aoa; gc.collect()
     buf=io.BytesIO(); wb.save(buf); buf.seek(0)
     del wb; gc.collect()
     return buf, f'PESOS_{tipo}_W{semana:02d}_{anio}.xlsx'
+
+# ── Rutas ─────────────────────────────────────────────────────────────────────
+@app.route('/')
+def index():
+    now=datetime.now()
+    return render_template_string(HTML,sem=now.isocalendar()[1],anio=now.year)
+
+@app.route('/iniciar', methods=['POST'])
+def iniciar():
+    """Recibe el fichero, lanza el procesamiento en un hilo, devuelve job_id inmediatamente."""
+    cleanup_old_jobs()
+    file  = request.files.get('file')
+    tipo  = request.form.get('tipo','FULL_PRICE')
+    sem   = int(request.form.get('semana',1))
+    anio  = int(request.form.get('anio',datetime.now().year))
+    if not file: return jsonify(error='No se recibió archivo'), 400
+
+    file_bytes = file.read()
+    job_id = str(uuid.uuid4())
+
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            'status':'running', 'progress':0,
+            'message':'Iniciando...', 'result_buf':None,
+            'fname':None, 'error':None, 'ts':time.time()
+        }
+
+    t = threading.Thread(target=procesar, args=(job_id,file_bytes,tipo,sem,anio), daemon=True)
+    t.start()
+    return jsonify(job_id=job_id)
+
+@app.route('/estado/<job_id>')
+def estado(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job: return jsonify(error='Job no encontrado'),404
+    return jsonify(
+        status   = job['status'],
+        progress = job['progress'],
+        message  = job['message'],
+        fname    = job['fname'],
+        error    = job['error']
+    )
+
+@app.route('/descargar/<job_id>')
+def descargar(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job or job['status']!='done':
+        return 'No disponible', 404
+    buf   = job['result_buf']
+    fname = job['fname']
+    buf.seek(0)
+    return send_file(buf,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True, download_name=fname)
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 HTML='''<!DOCTYPE html>
@@ -367,12 +461,12 @@ main{max-width:760px;margin:0 auto;padding:36px 20px 80px}
 .chip{font-size:10px;font-weight:600;padding:3px 8px;border-radius:4px}
 .c-blk{background:var(--ink);color:var(--accent)}.c-org{background:var(--orange);color:#fff}
 .c-grn{background:var(--green);color:var(--green-dk)}.c-red{background:var(--red);color:#9c0006}
-#prog{display:none;padding:20px 22px;background:var(--card);border-radius:12px;border:1px solid var(--border);margin-bottom:24px;text-align:center}
-.spinner{width:36px;height:36px;border:3px solid var(--border);border-top-color:var(--ink);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px}
-@keyframes spin{to{transform:rotate(360deg)}}
-.prog-lbl{font-family:'DM Mono',monospace;font-size:12px;color:var(--mid)}
-.prog-bar-bg{width:100%;height:3px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:12px}
-.prog-bar-fill{height:100%;background:var(--ink);border-radius:2px;width:0%;transition:width .4s ease}
+#prog{display:none;padding:20px 22px;background:var(--card);border-radius:12px;border:1px solid var(--border);margin-bottom:24px}
+.prog-top{display:flex;justify-content:space-between;margin-bottom:8px}
+.prog-lbl{font-family:'DM Mono',monospace;font-size:11px;color:var(--mid)}
+.prog-pct{font-family:'DM Mono',monospace;font-size:12px;font-weight:500}
+.prog-track{height:4px;background:var(--border);border-radius:2px;overflow:hidden}
+.prog-fill{height:100%;background:var(--ink);border-radius:2px;transition:width .5s ease;width:0%}
 #err{display:none;background:#fff5f5;border:1px solid #ffd0d0;border-radius:10px;padding:14px 18px;font-size:12px;color:#cc2222;margin-bottom:20px;font-family:'DM Mono',monospace;white-space:pre-wrap}
 #btn{width:100%;padding:16px;background:var(--ink);color:var(--accent);border:none;border-radius:12px;font-family:'DM Mono',monospace;font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:10px}
 #btn:hover:not(:disabled){background:#1e1e2e;transform:translateY(-1px)}
@@ -380,8 +474,7 @@ main{max-width:760px;margin:0 auto;padding:36px 20px 80px}
 .results{display:flex;flex-direction:column;gap:12px;margin-top:20px}
 .rc{background:var(--ink);border-radius:14px;padding:22px 26px;color:#fff;display:flex;align-items:center;justify-content:space-between;gap:20px}
 .ri{display:flex;align-items:center;gap:14px}
-.ricon{font-size:26px}
-.rname{font-family:'DM Mono',monospace;font-size:13px;color:var(--accent);font-weight:500}
+.ricon{font-size:26px}.rname{font-family:'DM Mono',monospace;font-size:13px;color:var(--accent);font-weight:500}
 .rsub{font-size:11px;color:#666;margin-top:2px}
 .dl{padding:10px 20px;background:var(--accent);color:var(--ink);border:none;border-radius:8px;font-family:'DM Mono',monospace;font-size:12px;font-weight:700;text-transform:uppercase;cursor:pointer;white-space:nowrap;text-decoration:none;display:inline-block}
 .dl:hover{background:#d4ff40}
@@ -411,9 +504,11 @@ main{max-width:760px;margin:0 auto;padding:36px 20px 80px}
   </div>
   <div id="err"></div>
   <div id="prog">
-    <div class="spinner"></div>
-    <div class="prog-lbl" id="plbl">Procesando... puede tardar 1-2 minutos</div>
-    <div class="prog-bar-bg"><div class="prog-bar-fill" id="pfill"></div></div>
+    <div class="prog-top">
+      <span class="prog-lbl" id="plbl">Procesando...</span>
+      <span class="prog-pct" id="ppct">0%</span>
+    </div>
+    <div class="prog-track"><div class="prog-fill" id="pfill"></div></div>
   </div>
   <button id="btn" disabled>→ &nbsp;Generar PESOS</button>
   <div class="results" id="results"></div>
@@ -424,6 +519,8 @@ function upPill(){$('wpill').textContent=`W${String($('isem').value).padStart(2,
 function chkReady(){$('btn').disabled=!Object.keys(files).length;}
 function showErr(m){const e=$('err');e.textContent=m;e.style.display='block';}
 function hideErr(){$('err').style.display='none';}
+function setProg(p,l){$('pfill').style.width=p+'%';$('ppct').textContent=p+'%';if(l)$('plbl').textContent=l;}
+
 function setupDz(key){
   const dz=$(`dz-${key}`);
   dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('over');});
@@ -454,62 +551,70 @@ function clrFile(key){
 }
 setupDz('fp');setupDz('out');
 $('isem').addEventListener('input',upPill);$('ianio').addEventListener('input',upPill);upPill();
-let ti=null;
-function startP(){let p=5;$('pfill').style.width='5%';ti=setInterval(()=>{if(p<88){p+=1.5;$('pfill').style.width=p+'%';}},1500);}
-function stopP(){clearInterval(ti);$('pfill').style.width='100%';}
+
+async function waitForJob(jobId,icon,tipo,sem,anio){
+  return new Promise((resolve,reject)=>{
+    const poll=setInterval(async()=>{
+      try{
+        const r=await fetch(`/estado/${jobId}`);
+        const j=await r.json();
+        setProg(j.progress, j.message);
+        if(j.status==='done'){
+          clearInterval(poll);
+          resolve({jobId,icon,tipo,fname:j.fname,sem,anio});
+        } else if(j.status==='error'){
+          clearInterval(poll);
+          reject(new Error(j.error||'Error desconocido'));
+        }
+      }catch(e){clearInterval(poll);reject(e);}
+    },2000);
+  });
+}
+
 $('btn').addEventListener('click',async()=>{
-  hideErr();$('results').innerHTML='';$('btn').disabled=true;$('prog').style.display='block';startP();
-  const sem=$('isem').value,anio=$('ianio').value,cards=[];
+  hideErr();$('results').innerHTML='';$('btn').disabled=true;
+  $('prog').style.display='block';setProg(0,'Subiendo archivo...');
+
+  const sem=$('isem').value,anio=$('ianio').value;
+  const promises=[];
+
   try{
     for(const[key,file]of Object.entries(files)){
       const tipo=key==='fp'?'FULL_PRICE':'OUTLET';
-      $('plbl').textContent=`Generando ${tipo}... puede tardar 1-2 minutos`;
+      const icon=key==='fp'?'📋':'🏪';
       const fd=new FormData();
       fd.append('file',file);fd.append('tipo',tipo);
       fd.append('semana',sem);fd.append('anio',anio);
-      const resp=await fetch('/generar',{method:'POST',body:fd});
-      if(!resp.ok)throw new Error(await resp.text());
-      const blob=await resp.blob();
-      const fname=`PESOS_${tipo}_W${String(sem).padStart(2,'0')}_${anio}.xlsx`;
-      cards.push({key,tipo,fname,url:URL.createObjectURL(blob)});
+
+      // /iniciar responde en <1s con el job_id
+      const r=await fetch('/iniciar',{method:'POST',body:fd});
+      if(!r.ok)throw new Error(await r.text());
+      const {job_id}=await r.json();
+      promises.push(waitForJob(job_id,icon,tipo,sem,anio));
     }
-    stopP();setTimeout(()=>$('prog').style.display='none',400);
-    $('results').innerHTML=cards.map(({key,tipo,fname,url})=>`
+
+    // Esperar todos los trabajos
+    const results=await Promise.all(promises);
+
+    setProg(100,'¡Listo!');
+    setTimeout(()=>$('prog').style.display='none',400);
+
+    $('results').innerHTML=results.map(({jobId,icon,tipo,fname})=>`
       <div class="rc">
-        <div class="ri"><span class="ricon">${key==='fp'?'📋':'🏪'}</span>
+        <div class="ri"><span class="ricon">${icon}</span>
           <div><div class="rname">${fname}</div>
           <div class="rsub">${tipo==='FULL_PRICE'?'Full Price':'Outlet'} · 10 pestañas</div></div></div>
-        <a class="dl" href="${url}" download="${fname}">↓ Descargar</a>
+        <a class="dl" href="/descargar/${jobId}" download="${fname}">↓ Descargar</a>
       </div>`).join('');
-  }catch(err){stopP();$('prog').style.display='none';showErr('Error: '+err.message);}
+  }catch(err){
+    $('prog').style.display='none';
+    showErr('Error: '+err.message);
+  }
   $('btn').disabled=false;
 });
 </script>
 </body>
 </html>'''
-
-@app.route('/')
-def index():
-    now=datetime.now()
-    return render_template_string(HTML,sem=now.isocalendar()[1],anio=now.year)
-
-@app.route('/generar',methods=['POST'])
-def generar():
-    try:
-        file=request.files.get('file')
-        tipo=request.form.get('tipo','FULL_PRICE')
-        sem=int(request.form.get('semana',1))
-        anio=int(request.form.get('anio',datetime.now().year))
-        if not file: return 'No se recibió ningún archivo',400
-        M=read_and_accumulate(file)
-        buf,fname=generar_excel(M,tipo,sem,anio)
-        del M; gc.collect()
-        return send_file(buf,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,download_name=fname)
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return str(e),500
 
 if __name__=='__main__':
     port=int(os.environ.get('PORT',5000))
