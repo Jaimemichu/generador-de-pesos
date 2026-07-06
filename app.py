@@ -375,15 +375,16 @@ def index():
 
 @app.route('/iniciar', methods=['POST'])
 def iniciar():
-    """Recibe el fichero, lanza el procesamiento en un hilo, devuelve job_id inmediatamente."""
+    """Recibe fichero como JSON base64, lanza hilo, devuelve job_id."""
     cleanup_old_jobs()
-    file  = request.files.get('file')
-    tipo  = request.form.get('tipo','FULL_PRICE')
-    sem   = int(request.form.get('semana',1))
-    anio  = int(request.form.get('anio',datetime.now().year))
-    if not file: return jsonify(error='No se recibió archivo'), 400
-
-    file_bytes = file.read()
+    import base64
+    data     = request.get_json(force=True)
+    tipo     = data.get('tipo','FULL_PRICE')
+    sem      = int(data.get('semana',1))
+    anio     = int(data.get('anio',datetime.now().year))
+    b64      = data.get('file_b64','')
+    if not b64: return jsonify(error='No se recibió archivo'), 400
+    file_bytes = base64.b64decode(b64)
     job_id = str(uuid.uuid4())
 
     with JOBS_LOCK:
@@ -582,12 +583,18 @@ $('btn').addEventListener('click',async()=>{
     for(const[key,file]of Object.entries(files)){
       const tipo=key==='fp'?'FULL_PRICE':'OUTLET';
       const icon=key==='fp'?'📋':'🏪';
-      const fd=new FormData();
-      fd.append('file',file);fd.append('tipo',tipo);
-      fd.append('semana',sem);fd.append('anio',anio);
-
-      // /iniciar responde en <1s con el job_id
-      const r=await fetch('/iniciar',{method:'POST',body:fd});
+      // Convertir fichero a base64 y enviar como JSON
+      const b64=await new Promise((res,rej)=>{
+        const rd=new FileReader();
+        rd.onload=()=>res(rd.result.split(',')[1]);
+        rd.onerror=rej;
+        rd.readAsDataURL(file);
+      });
+      const r=await fetch('/iniciar',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({file_b64:b64,tipo,semana:sem,anio})
+      });
       if(!r.ok)throw new Error(await r.text());
       const {job_id}=await r.json();
       promises.push(waitForJob(job_id,icon,tipo,sem,anio));
